@@ -1,0 +1,21 @@
+[Unit]
+Description=Sentinela - verificacao de saude do servidor
+Documentation=https://github.com/alexsilvan84/sentinela
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sentinela check
+User=root
+
+# O Sentinela so le do sistema e faz requisicoes de saida.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+StateDirectory=sentinela
+ReadWritePaths=/var/lib/sentinela
+
+[Install]
+WantedBy=multi-user.target

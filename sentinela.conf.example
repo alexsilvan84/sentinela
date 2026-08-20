@@ -1,0 +1,73 @@
+# Sentinela - arquivo de configuracao
+#
+# Copie para /etc/sentinela.conf (ou ~/.config/sentinela/sentinela.conf)
+# e ajuste o que precisar. Toda chave e opcional: o que nao estiver aqui usa
+# o valor padrao mostrado ao lado.
+#
+# Este arquivo NAO e executado pelo shell. E lido como chave=valor, entao
+# $(comando) e crase ficam como texto literal.
+
+
+# ---------------------------------------------------------------------------
+# Limites
+# ---------------------------------------------------------------------------
+
+# Percentual de uso a partir do qual o alerta dispara.
+limite_cpu=85
+limite_memoria=85
+limite_disco=90
+
+# Carga por nucleo. Com limite_carga=2.0 num servidor de 4 CPUs, o alerta
+# dispara quando o load passa de 8.0.
+limite_carga=2.0
+
+
+# ---------------------------------------------------------------------------
+# O que verificar
+# ---------------------------------------------------------------------------
+
+# Pontos de montagem, separados por virgula.
+disco=/
+
+# Endpoints HTTP. Use url ou url|codigo_esperado (o padrao e 200).
+# http=https://meusite.com.br, https://api.meusite.com.br/health|200
+http=
+
+# Portas TCP no formato host:porta, separadas por virgula.
+# porta=localhost:22, localhost:3306, db.interno:5432
+porta=
+
+# Servicos do systemd, separados por virgula.
+# servico=nginx, mysql, docker
+servico=
+
+# Segundos de espera para uma resposta HTTP.
+http_timeout=10
+
+
+# ---------------------------------------------------------------------------
+# Alertas
+#
+# Configure quantos canais quiser: a mensagem vai por todos ao mesmo tempo.
+# Sem nenhum canal, o Sentinela ainda funciona: imprime na tela e devolve o
+# codigo de saida, o que ja serve para cron e para pipeline de CI.
+# ---------------------------------------------------------------------------
+
+# Telegram. Crie um bot com o @BotFather e pegue o chat_id com o @userinfobot.
+alerta_telegram_token=
+alerta_telegram_chat=
+
+# Webhook. Funciona com Discord, Slack e Mattermost sem adaptacao.
+# alerta_webhook=https://discord.com/api/webhooks/000/xxx
+alerta_webhook=
+
+# E-mail. Precisa do comando `mail` instalado (pacote mailutils).
+# alerta_email=voce@exemplo.com
+alerta_email=
+
+# Segundos de silencio antes de repetir o mesmo alerta, para nao virar spam
+# quando o problema demora a ser resolvido. Padrao: 30 minutos.
+alerta_cooldown=1800
+
+# Nome que aparece na mensagem. Vazio usa o hostname da maquina.
+nome_host=

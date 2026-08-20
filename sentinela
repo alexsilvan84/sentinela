@@ -1,0 +1,670 @@
+#!/usr/bin/env bash
+#
+# Sentinela - monitor de servidor em Bash puro.
+# https://github.com/alexsilvan84/sentinela
+#
+# Verifica CPU, memoria, disco, carga, portas, servicos e endpoints HTTP.
+# Avisa por Telegram, webhook ou e-mail quando algo sai do limite, e avisa de
+# novo quando volta ao normal.
+
+set -uo pipefail
+
+readonly VERSAO="1.0.0"
+readonly PROGRAMA="${0##*/}"
+
+# ---------------------------------------------------------------------------
+# Saida
+# ---------------------------------------------------------------------------
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_OK=$'\033[32m'; C_ALERTA=$'\033[31m'; C_AVISO=$'\033[33m'
+    C_FRACO=$'\033[2m'; C_FIM=$'\033[0m'
+else
+    C_OK=""; C_ALERTA=""; C_AVISO=""; C_FRACO=""; C_FIM=""
+fi
+readonly C_OK C_ALERTA C_AVISO C_FRACO C_FIM
+
+agora()      { date '+%Y-%m-%d %H:%M:%S'; }
+log()        { printf '%s\n' "$*"; }
+log_ok()     { printf '%s  %-30s %s%s%s\n' "$(agora)" "$1" "$C_OK" "$2" "$C_FIM"; }
+log_alerta() { printf '%s  %-30s %s%s%s\n' "$(agora)" "$1" "$C_ALERTA" "$2" "$C_FIM"; }
+log_fraco()  { printf '%s  %-30s %s%s%s\n' "$(agora)" "$1" "$C_FRACO" "$2" "$C_FIM"; }
+erro()       { printf '%s%s: %s%s\n' "$C_ALERTA" "$PROGRAMA" "$*" "$C_FIM" >&2; }
+aviso()      { printf '%s%s: %s%s\n' "$C_AVISO" "$PROGRAMA" "$*" "$C_FIM" >&2; }
+
+# ---------------------------------------------------------------------------
+# Configuracao
+#
+# O arquivo e lido como chave=valor, linha a linha. Nao usamos `source` de
+# proposito: um .conf nao deveria ser capaz de executar comandos.
+# ---------------------------------------------------------------------------
+
+declare -A CONFIG=(
+    [limite_cpu]=85
+    [limite_memoria]=85
+    [limite_disco]=90
+    [limite_carga]=2.0
+    [disco]=/
+    [http]=""
+    [porta]=""
+    [servico]=""
+    [alerta_telegram_token]=""
+    [alerta_telegram_chat]=""
+    [alerta_webhook]=""
+    [alerta_email]=""
+    [alerta_cooldown]=1800
+    [http_timeout]=10
+    [nome_host]=""
+)
+
+apara() {
+    local texto="$1"
+    texto="${texto#"${texto%%[![:space:]]*}"}"
+    texto="${texto%"${texto##*[![:space:]]}"}"
+    printf '%s' "$texto"
+}
+
+tira_aspas() {
+    local texto="$1" primeiro="${1:0:1}" ultimo="${1: -1}"
+
+    if [ ${#texto} -ge 2 ] && [ "$primeiro" = "$ultimo" ]; then
+        case "$primeiro" in
+            '"'|"'") texto="${texto:1:${#texto}-2}" ;;
+        esac
+    fi
+
+    printf '%s' "$texto"
+}
+
+carrega_config() {
+    local arquivo="$1" linha chave valor numero=0
+
+    while IFS= read -r linha || [ -n "$linha" ]; do
+        numero=$((numero + 1))
+        linha="$(apara "$linha")"
+
+        # O comentario vale a linha inteira. Cortar tudo depois de um "#"
+        # quebraria URLs que tenham fragmento.
+        [ -z "$linha" ] && continue
+        [ "${linha:0:1}" = "#" ] && continue
+
+        if [[ "$linha" != *=* ]]; then
+            aviso "$arquivo linha $numero ignorada (nao e chave=valor)"
+            continue
+        fi
+
+        chave="$(apara "${linha%%=*}")"
+        valor="$(tira_aspas "$(apara "${linha#*=}")")"
+
+        if [ -z "${CONFIG[$chave]+definida}" ]; then
+            aviso "$arquivo linha $numero: chave desconhecida '$chave'"
+            continue
+        fi
+
+        CONFIG["$chave"]="$valor"
+    done < "$arquivo"
+}
+
+localiza_config() {
+    local candidatos=(
+        "${SENTINELA_CONFIG:-}"
+        "./sentinela.conf"
+        "${XDG_CONFIG_HOME:-$HOME/.config}/sentinela/sentinela.conf"
+        "/etc/sentinela/sentinela.conf"
+        "/etc/sentinela.conf"
+    )
+
+    local caminho
+    for caminho in "${candidatos[@]}"; do
+        if [ -n "$caminho" ] && [ -f "$caminho" ]; then
+            printf '%s' "$caminho"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Divide "a, b , c" em uma lista, ignorando itens vazios.
+divide_lista() {
+    local texto="$1" item
+    local IFS=','
+
+    # A divisao por palavra aqui e proposital: e assim que a lista e separada.
+    # shellcheck disable=SC2086
+    for item in $texto; do
+        item="$(apara "$item")"
+        [ -n "$item" ] && printf '%s\n' "$item"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Coleta
+# ---------------------------------------------------------------------------
+
+# Percentual de CPU em uso, medido por duas leituras de /proc/stat.
+# Uma leitura so daria a media desde o boot, que nao serve para alerta.
+percentual_cpu() {
+    [ -r /proc/stat ] || return 1
+
+    local -a a b
+    read -r -a a < <(grep '^cpu ' /proc/stat) || return 1
+    sleep 1
+    read -r -a b < <(grep '^cpu ' /proc/stat) || return 1
+
+    local i total_a=0 total_b=0
+    for ((i = 1; i < ${#a[@]}; i++)); do total_a=$((total_a + a[i])); done
+    for ((i = 1; i < ${#b[@]}; i++)); do total_b=$((total_b + b[i])); done
+
+    # indice 4 = idle, indice 5 = iowait
+    local ocioso_a=$((a[4] + a[5])) ocioso_b=$((b[4] + b[5]))
+    local d_total=$((total_b - total_a)) d_ocioso=$((ocioso_b - ocioso_a))
+
+    [ "$d_total" -le 0 ] && return 1
+
+    awk -v t="$d_total" -v o="$d_ocioso" 'BEGIN { printf "%.0f", 100 * (t - o) / t }'
+}
+
+# Usa MemAvailable em vez da coluna "used" do free: cache e buffer sao
+# reaproveitaveis e contariam como memoria ocupada sem estar de fato.
+percentual_memoria() {
+    [ -r /proc/meminfo ] || return 1
+
+    local total disponivel
+    total=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+    disponivel=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)
+
+    [ -n "$total" ] && [ -n "$disponivel" ] && [ "$total" -gt 0 ] || return 1
+
+    awk -v t="$total" -v d="$disponivel" 'BEGIN { printf "%.0f", 100 * (t - d) / t }'
+}
+
+percentual_disco() {
+    local ponto="$1" valor
+
+    # Procura o campo terminado em "%" em vez de assumir que e a coluna 5.
+    # Nomes de sistema de arquivos com espaco (montagem de rede, "C:/Program
+    # Files/Git" no Git Bash) deslocam as colunas e fariam ler o valor errado.
+    valor=$(df -P "$ponto" 2>/dev/null | awk '
+        NR == 2 {
+            for (i = NF; i >= 1; i--) {
+                if ($i ~ /^[0-9]+%$/) { gsub("%", "", $i); print $i; exit }
+            }
+        }')
+
+    [ -n "$valor" ] || return 1
+    printf '%s' "$valor"
+}
+
+carga_media() {
+    [ -r /proc/loadavg ] || return 1
+    awk '{ print $1 }' /proc/loadavg
+}
+
+nucleos() {
+    if [ -r /proc/cpuinfo ]; then
+        grep -c '^processor' /proc/cpuinfo
+    else
+        printf '1'
+    fi
+}
+
+codigo_http() {
+    local url="$1"
+    curl -s -o /dev/null -w '%{http_code}' \
+        --max-time "${CONFIG[http_timeout]}" "$url" 2>/dev/null || printf '000'
+}
+
+porta_aberta() {
+    local host="$1" porta="$2"
+    timeout 5 bash -c "exec 3<>/dev/tcp/$host/$porta" 2>/dev/null
+}
+
+servico_ativo() {
+    command -v systemctl >/dev/null 2>&1 || return 2
+    systemctl is-active --quiet "$1"
+}
+
+# Compara numeros com casa decimal. O `[` do shell so lida com inteiros e o
+# `bc` nem sempre esta instalado; awk esta em qualquer sistema.
+maior_que() {
+    awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'
+}
+
+identificacao() {
+    if [ -n "${CONFIG[nome_host]}" ]; then
+        printf '%s' "${CONFIG[nome_host]}"
+    else
+        hostname 2>/dev/null || printf 'servidor'
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Estado, para nao repetir o mesmo alerta a cada execucao
+# ---------------------------------------------------------------------------
+
+diretorio_estado() {
+    if [ "$(id -u 2>/dev/null || echo 1000)" -eq 0 ]; then
+        printf '/var/lib/sentinela'
+    else
+        printf '%s/sentinela' "${XDG_STATE_HOME:-$HOME/.local/state}"
+    fi
+}
+
+chave_estado() {
+    printf '%s' "$1" | tr -c 'a-zA-Z0-9' '_'
+}
+
+em_alerta() {
+    [ -f "$(diretorio_estado)/$(chave_estado "$1")" ]
+}
+
+marca_alerta() {
+    local dir
+    dir="$(diretorio_estado)"
+    mkdir -p "$dir" 2>/dev/null || return 1
+    date +%s > "$dir/$(chave_estado "$1")"
+}
+
+limpa_alerta() {
+    rm -f "$(diretorio_estado)/$(chave_estado "$1")" 2>/dev/null
+}
+
+# Ja avisou ha pouco? Entao segura, para o alerta nao virar spam.
+cooldown_vencido() {
+    local arquivo desde agora_s
+    arquivo="$(diretorio_estado)/$(chave_estado "$1")"
+
+    [ -f "$arquivo" ] || return 0
+
+    desde=$(cat "$arquivo" 2>/dev/null) || return 0
+    [[ "$desde" =~ ^[0-9]+$ ]] || return 0
+
+    agora_s=$(date +%s)
+    [ $((agora_s - desde)) -ge "${CONFIG[alerta_cooldown]}" ]
+}
+
+# ---------------------------------------------------------------------------
+# Envio de alertas
+# ---------------------------------------------------------------------------
+
+escapa_json() {
+    local texto="$1"
+    texto="${texto//\\/\\\\}"
+    texto="${texto//\"/\\\"}"
+    texto="${texto//$'\n'/\\n}"
+    texto="${texto//$'\r'/\\r}"
+    texto="${texto//$'\t'/\\t}"
+    texto="${texto//$'\b'/\\b}"
+    texto="${texto//$'\f'/\\f}"
+
+    # JSON nao aceita caractere de controle cru dentro de string. Os que tem
+    # escape curto viraram texto acima; o resto sai fora, senao o webhook
+    # receberia um JSON invalido e o alerta se perderia em silencio.
+    texto="$(printf '%s' "$texto" | tr -d '\000-\037')"
+
+    printf '%s' "$texto"
+}
+
+envia_telegram() {
+    local texto="$1"
+    local token="${CONFIG[alerta_telegram_token]}" chat="${CONFIG[alerta_telegram_chat]}"
+
+    [ -n "$token" ] && [ -n "$chat" ] || return 1
+
+    curl -s -o /dev/null --max-time 15 \
+        -X POST "https://api.telegram.org/bot$token/sendMessage" \
+        --data-urlencode "chat_id=$chat" \
+        --data-urlencode "text=$texto"
+}
+
+envia_webhook() {
+    local texto="$1" url="${CONFIG[alerta_webhook]}"
+
+    [ -n "$url" ] || return 1
+
+    # O campo "content" atende o Discord e o "text" atende Slack e Mattermost.
+    curl -s -o /dev/null --max-time 15 \
+        -H 'Content-Type: application/json' \
+        -X POST "$url" \
+        -d "{\"content\":\"$(escapa_json "$texto")\",\"text\":\"$(escapa_json "$texto")\"}"
+}
+
+envia_email() {
+    local texto="$1" destino="${CONFIG[alerta_email]}"
+
+    [ -n "$destino" ] || return 1
+    command -v mail >/dev/null 2>&1 || return 1
+
+    printf '%s\n' "$texto" | mail -s "[Sentinela] $(identificacao)" "$destino"
+}
+
+# Dispara em todos os canais configurados. Devolve 0 se pelo menos um aceitou.
+notifica() {
+    local texto="$1" enviados=0
+
+    envia_telegram "$texto" && enviados=$((enviados + 1))
+    envia_webhook  "$texto" && enviados=$((enviados + 1))
+    envia_email    "$texto" && enviados=$((enviados + 1))
+
+    [ "$enviados" -gt 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# Motor de verificacao
+# ---------------------------------------------------------------------------
+
+TOTAL=0
+FALHAS=0
+SILENCIOSO=0
+
+# avalia <chave> <rotulo> <ok:0|1> <mensagem>
+#
+# Concentra a decisao: quando falha, alerta respeitando o cooldown; quando
+# volta ao normal depois de ter falhado, avisa da recuperacao.
+avalia() {
+    local chave="$1" rotulo="$2" ok="$3" mensagem="$4"
+
+    TOTAL=$((TOTAL + 1))
+
+    if [ "$ok" -eq 0 ]; then
+        [ "$SILENCIOSO" -eq 0 ] && log_ok "$rotulo" "OK    $mensagem"
+
+        if em_alerta "$chave"; then
+            limpa_alerta "$chave"
+            notifica "[OK] $(identificacao): $rotulo voltou ao normal. $mensagem"
+        fi
+
+        return 0
+    fi
+
+    FALHAS=$((FALHAS + 1))
+    [ "$SILENCIOSO" -eq 0 ] && log_alerta "$rotulo" "FALHA $mensagem"
+
+    if cooldown_vencido "$chave"; then
+        notifica "[ALERTA] $(identificacao): $rotulo. $mensagem"
+        marca_alerta "$chave"
+    fi
+
+    return 1
+}
+
+checa_cpu() {
+    local uso
+    uso="$(percentual_cpu)" || { [ "$SILENCIOSO" -eq 0 ] && log_fraco "cpu" "PULADO  /proc/stat indisponivel"; return 0; }
+
+    if maior_que "$uso" "${CONFIG[limite_cpu]}"; then
+        avalia "cpu" "cpu" 1 "uso em ${uso}% (limite ${CONFIG[limite_cpu]}%)"
+    else
+        avalia "cpu" "cpu" 0 "uso em ${uso}% (limite ${CONFIG[limite_cpu]}%)"
+    fi
+}
+
+checa_memoria() {
+    local uso
+    uso="$(percentual_memoria)" || { [ "$SILENCIOSO" -eq 0 ] && log_fraco "memoria" "PULADO  /proc/meminfo indisponivel"; return 0; }
+
+    if maior_que "$uso" "${CONFIG[limite_memoria]}"; then
+        avalia "memoria" "memoria" 1 "uso em ${uso}% (limite ${CONFIG[limite_memoria]}%)"
+    else
+        avalia "memoria" "memoria" 0 "uso em ${uso}% (limite ${CONFIG[limite_memoria]}%)"
+    fi
+}
+
+checa_carga() {
+    local carga limite nucleos_cpu
+    carga="$(carga_media)" || { [ "$SILENCIOSO" -eq 0 ] && log_fraco "carga" "PULADO  /proc/loadavg indisponivel"; return 0; }
+
+    nucleos_cpu="$(nucleos)"
+    # O limite e por nucleo: carga 4 num servidor de 4 CPUs e normal.
+    limite="$(awk -v l="${CONFIG[limite_carga]}" -v n="$nucleos_cpu" 'BEGIN { printf "%.2f", l * n }')"
+
+    if maior_que "$carga" "$limite"; then
+        avalia "carga" "carga" 1 "load $carga (limite $limite para $nucleos_cpu nucleo(s))"
+    else
+        avalia "carga" "carga" 0 "load $carga (limite $limite para $nucleos_cpu nucleo(s))"
+    fi
+}
+
+checa_disco() {
+    local ponto uso
+    while IFS= read -r ponto; do
+        uso="$(percentual_disco "$ponto")" || {
+            avalia "disco:$ponto" "disco $ponto" 1 "ponto de montagem inacessivel"
+            continue
+        }
+
+        if [ "$uso" -gt "${CONFIG[limite_disco]}" ]; then
+            avalia "disco:$ponto" "disco $ponto" 1 "uso em ${uso}% (limite ${CONFIG[limite_disco]}%)"
+        else
+            avalia "disco:$ponto" "disco $ponto" 0 "uso em ${uso}% (limite ${CONFIG[limite_disco]}%)"
+        fi
+    done < <(divide_lista "${CONFIG[disco]}")
+}
+
+checa_http() {
+    local item url esperado codigo
+    while IFS= read -r item; do
+        # Formato: url ou url|codigo_esperado
+        if [[ "$item" == *"|"* ]]; then
+            url="$(apara "${item%%|*}")"
+            esperado="$(apara "${item##*|}")"
+        else
+            url="$item"
+            esperado="200"
+        fi
+
+        codigo="$(codigo_http "$url")"
+
+        if [ "$codigo" = "$esperado" ]; then
+            avalia "http:$url" "http $url" 0 "respondeu $codigo"
+        else
+            avalia "http:$url" "http $url" 1 "respondeu $codigo, esperado $esperado"
+        fi
+    done < <(divide_lista "${CONFIG[http]}")
+}
+
+checa_porta() {
+    local item host porta
+    while IFS= read -r item; do
+        host="${item%%:*}"
+        porta="${item##*:}"
+
+        if [ "$host" = "$porta" ]; then
+            aviso "porta '$item' ignorada: use host:porta"
+            continue
+        fi
+
+        if porta_aberta "$host" "$porta"; then
+            avalia "porta:$item" "porta $item" 0 "aberta"
+        else
+            avalia "porta:$item" "porta $item" 1 "fechada ou inacessivel"
+        fi
+    done < <(divide_lista "${CONFIG[porta]}")
+}
+
+checa_servico() {
+    local nome
+    while IFS= read -r nome; do
+        servico_ativo "$nome"
+        case $? in
+            0) avalia "servico:$nome" "servico $nome" 0 "ativo" ;;
+            2) [ "$SILENCIOSO" -eq 0 ] && log_fraco "servico $nome" "PULADO  systemctl indisponivel" ;;
+            *) avalia "servico:$nome" "servico $nome" 1 "parado" ;;
+        esac
+    done < <(divide_lista "${CONFIG[servico]}")
+}
+
+executa_verificacoes() {
+    checa_cpu
+    checa_memoria
+    checa_carga
+    checa_disco
+    checa_http
+    checa_porta
+    checa_servico
+}
+
+# ---------------------------------------------------------------------------
+# Comandos
+# ---------------------------------------------------------------------------
+
+uso() {
+    cat <<AJUDA
+Sentinela $VERSAO - monitor de servidor em Bash puro
+
+USO
+  $PROGRAMA [comando] [opcoes]
+
+COMANDOS
+  check      roda as verificacoes e alerta quando algo sai do limite (padrao)
+  status     mostra os valores atuais sem enviar nenhum alerta
+  testar     envia uma mensagem de teste pelos canais configurados
+  config     mostra a configuracao em uso e de onde ela veio
+  versao     mostra a versao
+
+OPCOES
+  -c, --config ARQUIVO   usa este arquivo de configuracao
+  -q, --quiet            nao imprime nada, so define o codigo de saida
+  -h, --help             mostra esta ajuda
+
+CODIGOS DE SAIDA
+  0  todas as verificacoes passaram
+  1  ao menos uma verificacao falhou
+  2  erro de uso ou de configuracao
+
+ARQUIVO DE CONFIGURACAO
+  Procurado nesta ordem:
+    \$SENTINELA_CONFIG
+    ./sentinela.conf
+    \${XDG_CONFIG_HOME:-~/.config}/sentinela/sentinela.conf
+    /etc/sentinela/sentinela.conf
+    /etc/sentinela.conf
+
+EXEMPLOS
+  $PROGRAMA                          roda com a configuracao encontrada
+  $PROGRAMA status                   so olha, nao avisa ninguem
+  $PROGRAMA -c ./meu.conf check      usa uma configuracao especifica
+  $PROGRAMA testar                   confere se o Telegram esta funcionando
+AJUDA
+}
+
+cmd_check() {
+    executa_verificacoes
+
+    if [ "$SILENCIOSO" -eq 0 ]; then
+        log ""
+        if [ "$FALHAS" -eq 0 ]; then
+            log "${C_OK}$TOTAL verificacao(oes), tudo dentro do limite.${C_FIM}"
+        else
+            log "${C_ALERTA}$FALHAS de $TOTAL verificacao(oes) falharam.${C_FIM}"
+        fi
+    fi
+
+    [ "$FALHAS" -eq 0 ]
+}
+
+cmd_status() {
+    # Neutraliza o envio: status olha, mas nao avisa ninguem.
+    notifica() { return 0; }
+    marca_alerta() { return 0; }
+    limpa_alerta() { return 0; }
+
+    executa_verificacoes
+
+    log ""
+    log "$TOTAL verificacao(oes), $FALHAS fora do limite."
+    return 0
+}
+
+cmd_testar() {
+    local canais=()
+    [ -n "${CONFIG[alerta_telegram_token]}" ] && canais+=("telegram")
+    [ -n "${CONFIG[alerta_webhook]}" ] && canais+=("webhook")
+    [ -n "${CONFIG[alerta_email]}" ] && canais+=("e-mail")
+
+    if [ ${#canais[@]} -eq 0 ]; then
+        erro "nenhum canal de alerta configurado"
+        log "Configure ao menos um: alerta_telegram_token, alerta_webhook ou alerta_email."
+        return 2
+    fi
+
+    log "Enviando teste por: ${canais[*]}"
+
+    if notifica "[TESTE] $(identificacao): o Sentinela esta configurado corretamente."; then
+        log "${C_OK}Mensagem enviada.${C_FIM}"
+        return 0
+    fi
+
+    erro "nenhum canal aceitou a mensagem"
+    return 1
+}
+
+cmd_config() {
+    local chave
+    log "Arquivo em uso: ${ARQUIVO_CONFIG:-nenhum (usando os padroes)}"
+    log ""
+
+    for chave in $(printf '%s\n' "${!CONFIG[@]}" | sort); do
+        # Nao imprime segredo em tela nem em log.
+        case "$chave" in
+            *token*|*webhook*)
+                if [ -n "${CONFIG[$chave]}" ]; then
+                    printf '  %-24s %s\n' "$chave" "(definido)"
+                else
+                    printf '  %-24s %s\n' "$chave" "(vazio)"
+                fi
+                ;;
+            *)
+                printf '  %-24s %s\n' "$chave" "${CONFIG[$chave]}"
+                ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Entrada
+# ---------------------------------------------------------------------------
+
+main() {
+    local comando="" config_forcada=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -c|--config)
+                [ $# -ge 2 ] || { erro "--config exige um arquivo"; return 2; }
+                config_forcada="$2"; shift 2 ;;
+            -q|--quiet)  SILENCIOSO=1; shift ;;
+            -h|--help)   uso; return 0 ;;
+            -*)          erro "opcao desconhecida: $1"; return 2 ;;
+            *)
+                [ -n "$comando" ] && { erro "comando repetido: $1"; return 2; }
+                comando="$1"; shift ;;
+        esac
+    done
+
+    if [ -n "$config_forcada" ]; then
+        [ -f "$config_forcada" ] || { erro "arquivo nao encontrado: $config_forcada"; return 2; }
+        ARQUIVO_CONFIG="$config_forcada"
+    else
+        ARQUIVO_CONFIG="$(localiza_config || true)"
+    fi
+
+    [ -n "$ARQUIVO_CONFIG" ] && carrega_config "$ARQUIVO_CONFIG"
+
+    case "${comando:-check}" in
+        check)   cmd_check ;;
+        status)  cmd_status ;;
+        testar)  cmd_testar ;;
+        config)  cmd_config ;;
+        versao|version) log "Sentinela $VERSAO" ;;
+        ajuda|help) uso ;;
+        *)       erro "comando desconhecido: $comando"; log ""; uso; return 2 ;;
+    esac
+}
+
+# So executa quando chamado direto. Assim os testes podem carregar as funcoes
+# sem disparar as verificacoes.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    main "$@"
+fi

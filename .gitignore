@@ -1,0 +1,12 @@
+# Configuracao real: guarda token do Telegram e URL de webhook
+sentinela.conf
+
+# Estado local
+.sentinela-state/
+*.log
+
+# Sistema
+.DS_Store
+Thumbs.db
+*.swp
+.github/
