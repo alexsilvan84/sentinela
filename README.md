@@ -40,6 +40,13 @@ E quando o problema passa, chega o aviso de volta:
 
 > **[OK] web-01:** disco / voltou ao normal. uso em 62% (limite 90%)
 
+## Documentacao
+
+| Documento | Para que serve |
+| --- | --- |
+| **[Guia de configuracao](docs/guia-de-configuracao.md)** | passo a passo do zero ate receber alerta no celular, em 15 minutos — inclui como criar o bot do Telegram e como provocar uma falha de proposito para testar |
+| **[Como funciona](docs/como-funciona.md)** | de onde sai cada numero: `/proc/stat`, `MemAvailable`, load average por nucleo, `/dev/tcp`, e por que cada decisao foi tomada |
+
 ## Instalar
 
 ```bash
