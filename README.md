@@ -196,7 +196,11 @@ bash tests/run.sh
 de JSON, a comparacao com decimal, a leitura do `df`, a janela de cooldown e o
 ciclo completo de alerta e recuperacao.
 
-Alem dos testes, o projeto passa pelo `shellcheck`.
+Para conferir o estilo do codigo tambem:
+
+```bash
+shellcheck -S warning sentinela install.sh tests/run.sh
+```
 
 ## Licenca
 
