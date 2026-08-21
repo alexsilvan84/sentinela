@@ -1,5 +1,6 @@
 # Sentinela
 
+[![CI](https://github.com/alexsilvan84/sentinela/actions/workflows/ci.yml/badge.svg)](https://github.com/alexsilvan84/sentinela/actions/workflows/ci.yml)
 [![Licenca: MIT](https://img.shields.io/badge/licenca-MIT-blue.svg)](LICENSE)
 [![Bash](https://img.shields.io/badge/bash-4.0%2B-lightgrey.svg)](#requisitos)
 
