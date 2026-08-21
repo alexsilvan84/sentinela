@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  testes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar o shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Analise estatica
+        run: shellcheck -S warning sentinela install.sh tests/run.sh
+
+      - name: Testes
+        run: bash tests/run.sh
+
+      - name: Verificar em um servidor de verdade
+        run: |
+          # Roda contra a propria maquina do runner, com limites folgados,
+          # para garantir que a coleta funciona num Linux real.
+          cat > ci.conf <<CONF
+          limite_cpu=99
+          limite_memoria=99
+          limite_disco=99
+          limite_carga=99
+          disco=/
+          http=https://example.com|200
+          porta=example.com:443
+          CONF
+          ./sentinela -c ci.conf check
+
+      - name: Instalador roda sem erro
+        run: |
+          ./install.sh --user
+          ~/.local/bin/sentinela versao
