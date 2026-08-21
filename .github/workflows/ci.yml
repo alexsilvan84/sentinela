@@ -15,7 +15,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: Analise estatica
-        run: shellcheck -S warning sentinela install.sh tests/run.sh
+        # -x faz o shellcheck seguir o `source ../sentinela` dos testes. Sem
+        # isso ele nao enxerga o array CONFIG nem as variaveis do script
+        # principal, e acusa como nao atribuido o que ja esta la.
+        run: shellcheck -x -S warning sentinela install.sh tests/run.sh
 
       - name: Testes
         run: bash tests/run.sh
