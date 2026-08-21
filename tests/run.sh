@@ -18,7 +18,10 @@ export XDG_STATE_HOME XDG_CONFIG_HOME SENTINELA_CONFIG
 
 trap 'rm -rf "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$TEMP"' EXIT
 
-# shellcheck source=../sentinela disable=SC1091
+# O caminho e montado em tempo de execucao, entao o shellcheck precisa da
+# dica abaixo para achar o arquivo: SCRIPTDIR o faz resolver ../sentinela a
+# partir da pasta deste script, e nao da pasta de onde o comando foi rodado.
+# shellcheck source-path=SCRIPTDIR source=../sentinela
 source "$RAIZ/sentinela"
 
 PASSOU=0
